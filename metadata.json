@@ -1,0 +1,5 @@
+{
+  "name": "GnuCash Statement Processor",
+  "description": "A professional tool to parse PDF bank statements, categorize transactions, and export them for GnuCash.",
+  "requestFramePermissions": []
+}
