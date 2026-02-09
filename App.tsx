@@ -1,49 +1,60 @@
 import React, { useState, useCallback, useMemo, useEffect } from 'react';
 import { Transaction, ProcessingStats, ParseStatus } from './types';
-import { extractTextFromPDF, parseTransactions, getAutoCategory } from './services/parserService';
+import { extractTextFromPDF, parseTransactions } from './services/parserService';
 import { generateCSV, downloadCSV } from './services/csvService';
 import { INITIAL_RULES } from './constants';
 import StatsSidebar from './components/StatsSidebar';
 import TransactionRow from './components/TransactionRow';
-import { UploadCloud, Download, FileText, Search, Trash2, BrainCircuit } from 'lucide-react';
+import RulesModal from './components/RulesModal';
+import { UploadCloud, Download, FileText, Search, Trash2, Settings } from 'lucide-react';
 
 const App: React.FC = () => {
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [status, setStatus] = useState<ParseStatus>(ParseStatus.IDLE);
-  const [fileCount, setFileCount] = useState(0);
-  const [searchQuery, setSearchQuery] = useState('');
+  const [transactions, setTransactions] = useState<Transaction[]>(() => {
+    try {
+      const saved = localStorage.getItem('gnucash_transactions');
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) { return []; }
+  });
   
-  // State for categorization rules, seeded from localStorage if available
-  const [rules, setRules] = useState<Record<string, string>>(() => {
-    const saved = localStorage.getItem('gnucash_rules');
-    return saved ? JSON.parse(saved) : INITIAL_RULES;
+  const [status, setStatus] = useState<ParseStatus>(ParseStatus.IDLE);
+  const [fileCount, setFileCount] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('gnucash_file_count');
+      return saved ? parseInt(saved, 10) : 0;
+    } catch (e) { return 0; }
   });
 
-  // Persist rules whenever they change
+  const [searchQuery, setSearchQuery] = useState('');
+  const [isRulesModalOpen, setIsRulesModalOpen] = useState(false);
+
+  const [rules, setRules] = useState<Record<string, string>>(() => {
+    try {
+      const saved = localStorage.getItem('gnucash_rules');
+      return saved ? JSON.parse(saved) : INITIAL_RULES;
+    } catch (e) { return INITIAL_RULES; }
+  });
+
   useEffect(() => {
-    localStorage.setItem('gnucash_rules', JSON.stringify(rules));
-  }, [rules]);
+    try {
+      localStorage.setItem('gnucash_rules', JSON.stringify(rules));
+      localStorage.setItem('gnucash_transactions', JSON.stringify(transactions));
+      localStorage.setItem('gnucash_file_count', fileCount.toString());
+    } catch (e) { console.warn("Storage restricted"); }
+  }, [rules, transactions, fileCount]);
 
-  // --- Statistics Calculation ---
   const stats: ProcessingStats = useMemo(() => {
-    const totalDebits = transactions
-      .filter(t => t.type === 'DEBIT')
-      .reduce((acc, t) => acc + t.amount, 0);
-    const totalCredits = transactions
-      .filter(t => t.type === 'CREDIT')
-      .reduce((acc, t) => acc + t.amount, 0);
-
+    const debits = transactions.filter(t => t.type === 'DEBIT').reduce((acc, t) => acc + t.amount, 0);
+    const credits = transactions.filter(t => t.type === 'CREDIT').reduce((acc, t) => acc + t.amount, 0);
     return {
       totalFiles: fileCount,
       totalTransactions: transactions.length,
-      totalDebits,
-      totalCredits,
-      netAmount: totalCredits - totalDebits,
+      totalDebits: debits,
+      totalCredits: credits,
+      netAmount: credits - debits,
       editedCount: transactions.filter(t => t.isEdited).length
     };
   }, [transactions, fileCount]);
 
-  // --- Handlers ---
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (!files || files.length === 0) return;
@@ -51,240 +62,137 @@ const App: React.FC = () => {
     setStatus(ParseStatus.PROCESSING);
     
     try {
-      let newTransactions: Transaction[] = [];
-      let processedCount = 0;
+      let combined: Transaction[] = [];
+      let successfulFiles = 0;
 
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        if (file.type === 'application/pdf') {
-          const text = await extractTextFromPDF(file);
-          const fileTrans = parseTransactions(text, file.name, rules);
-          newTransactions = [...newTransactions, ...fileTrans];
-          processedCount++;
+        if (file.name.toLowerCase().endsWith('.pdf')) {
+          try {
+            const raw = await extractTextFromPDF(file);
+            const parsed = parseTransactions(raw, file.name, rules);
+            if (parsed.length > 0) {
+              combined = [...combined, ...parsed];
+              successfulFiles++;
+            } else {
+              console.warn(`No transactions found in ${file.name}`);
+            }
+          } catch (err: any) {
+            alert(`Error reading ${file.name}: ${err.message}`);
+          }
         }
       }
 
-      setTransactions(prev => [...prev, ...newTransactions]);
-      setFileCount(prev => prev + processedCount);
-      setStatus(ParseStatus.SUCCESS);
+      if (combined.length > 0) {
+        setTransactions(prev => [...prev, ...combined]);
+        setFileCount(prev => prev + successfulFiles);
+        setStatus(ParseStatus.SUCCESS);
+      } else {
+        alert("Failed to find any transactions. Please ensure the PDF contains text (not just an image).");
+        setStatus(ParseStatus.IDLE);
+      }
     } catch (error) {
       console.error(error);
       setStatus(ParseStatus.ERROR);
-      alert('Failed to parse PDF. Please ensure it is a valid bank statement.');
+    } finally {
+      if (event.target) event.target.value = '';
+      setTimeout(() => setStatus(ParseStatus.IDLE), 1500);
     }
   };
 
-  const updateTransaction = useCallback((id: string, updates: Partial<Transaction>) => {
-    setTransactions(prev => {
-      const updatedList = prev.map(t => t.id === id ? { ...t, ...updates } : t);
-      const targetTransaction = updatedList.find(t => t.id === id);
-
-      // Rule Learning Logic
-      // If the category was updated, we treat the current description as a keyword for this category.
-      if (updates.category && targetTransaction && updates.category !== 'Expenses:Uncategorized') {
-        const keyword = targetTransaction.description; // Use the current (possibly edited) description
-        const newCategory = updates.category;
-
-        // 1. Update Rules State
-        const newRules = { ...rules, [keyword]: newCategory };
-        setRules(newRules);
-
-        // 2. Auto-apply to other similar transactions
-        // We only update transactions that are NOT edited yet, or strictly match the keyword
-        return updatedList.map(t => {
-          if (t.id === id) return t; // Skip the one we just manually touched
-          if (t.isEdited) return t; // Skip already reviewed ones to be safe
-
-          // Check if this transaction matches the new keyword rule
-          const suggestedCategory = getAutoCategory(t.description, newRules);
-          
-          if (suggestedCategory !== 'Expenses:Uncategorized' && suggestedCategory !== t.category) {
-             // Only auto-update if we found a better match
-             return { ...t, category: suggestedCategory };
-          }
-          return t;
-        });
-      }
-
-      return updatedList;
-    });
-  }, [rules]);
-
-  const deleteTransaction = useCallback((id: string) => {
-    setTransactions(prev => prev.filter(t => t.id !== id));
-  }, []);
-
-  const clearAll = () => {
-    if (confirm("Are you sure you want to clear all transactions?")) {
-        setTransactions([]);
-        setFileCount(0);
-        setStatus(ParseStatus.IDLE);
+  const clearAllData = () => {
+    if (window.confirm("This will permanently delete all processed transactions. Continue?")) {
+      setTransactions([]);
+      setFileCount(0);
+      setSearchQuery('');
+      localStorage.removeItem('gnucash_transactions');
+      localStorage.removeItem('gnucash_file_count');
+      setStatus(ParseStatus.IDLE);
     }
   };
 
-  const clearRules = () => {
-    if (confirm("This will reset all learned categorization rules. Continue?")) {
-        setRules(INITIAL_RULES);
-        localStorage.removeItem('gnucash_rules');
-        alert("Rules reset to defaults.");
-    }
-  }
-
-  const handleExport = () => {
-    if (transactions.length === 0) return;
-    const csvContent = generateCSV(transactions);
-    const filename = `gnucash_import_${new Date().toISOString().slice(0, 10)}.csv`;
-    downloadCSV(csvContent, filename);
-  };
-
-  // --- Filter Logic ---
   const filteredTransactions = useMemo(() => {
-    if (!searchQuery) return transactions;
-    const query = searchQuery.toLowerCase();
+    const q = searchQuery.toLowerCase();
     return transactions.filter(t => 
-      t.description.toLowerCase().includes(query) || 
-      t.category.toLowerCase().includes(query) ||
-      t.amount.toString().includes(query)
-    );
+      t.description.toLowerCase().includes(q) || t.category.toLowerCase().includes(q)
+    ).sort((a, b) => b.date.localeCompare(a.date));
   }, [transactions, searchQuery]);
 
   return (
-    <div className="min-h-screen pb-24">
-      {/* Header */}
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-30">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="bg-blue-600 p-2 rounded-lg">
-              <FileText className="w-5 h-5 text-white" />
-            </div>
-            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-indigo-600">
-              Statement Processor
-            </h1>
+    <div className="min-h-screen bg-slate-50 pb-32">
+      <RulesModal isOpen={isRulesModalOpen} onClose={() => setIsRulesModalOpen(false)} rules={rules} onUpdateRules={setRules} onResetDefaults={() => setRules(INITIAL_RULES)} />
+
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-30 px-6 h-16 flex items-center justify-between shadow-sm">
+        <div className="flex items-center gap-3">
+          <div className="bg-blue-600 p-2 rounded-xl text-white">
+            <FileText size={20} />
           </div>
-          <div className="flex items-center gap-4">
-            <button onClick={clearRules} className="text-xs text-slate-400 hover:text-slate-600 flex items-center gap-1" title="Reset Learned Rules">
-               <BrainCircuit className="w-3 h-3" /> Reset Brain
-            </button>
-            <div className="text-sm text-slate-500 hidden sm:block">
-              GnuCash Import Helper
-            </div>
-          </div>
+          <h1 className="text-xl font-black text-slate-800 tracking-tight">GnuCash Processor</h1>
         </div>
+        <button onClick={() => setIsRulesModalOpen(true)} className="flex items-center gap-2 px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-xl transition-all font-bold border border-slate-200">
+          <Settings size={18} /> Rules
+        </button>
       </header>
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        
-        {/* Upload Hero Section - Show if empty */}
-        {transactions.length === 0 && (
-          <div className="max-w-2xl mx-auto mt-12 text-center">
-            <div className="relative group cursor-pointer">
-              <input 
-                type="file" 
-                multiple 
-                accept=".pdf" 
-                onChange={handleFileUpload} 
-                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
-              />
-              <div className="border-3 border-dashed border-blue-300 rounded-3xl p-12 bg-blue-50/50 hover:bg-blue-50 transition-all group-hover:border-blue-500 group-hover:scale-[1.01]">
-                <div className="w-20 h-20 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center mx-auto mb-6 group-hover:bg-blue-600 group-hover:text-white transition-colors">
-                  {status === ParseStatus.PROCESSING ? (
-                    <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-current"></div>
-                  ) : (
-                    <UploadCloud className="w-10 h-10" />
-                  )}
-                </div>
-                <h2 className="text-2xl font-bold text-slate-800 mb-2">Drop Bank Statements PDF</h2>
-                <p className="text-slate-500 text-lg">
-                  Supports SBI, HDFC, ICICI, Axis & more. <br/>
-                  <span className="text-sm text-slate-400 mt-2 block">Parses text, matches categories, prepares for GnuCash.</span>
-                </p>
-                <div className="mt-6 inline-block px-6 py-2 bg-white border border-slate-200 rounded-full text-slate-600 text-sm font-medium shadow-sm">
-                  Click to Browse Files
-                </div>
-              </div>
+      <main className="max-w-7xl mx-auto px-6 py-8">
+        {status === ParseStatus.PROCESSING ? (
+          <div className="flex flex-col items-center justify-center py-32 text-slate-500">
+            <div className="relative w-16 h-16 mb-6">
+              <div className="absolute inset-0 border-4 border-blue-100 rounded-full"></div>
+              <div className="absolute inset-0 border-4 border-blue-600 border-t-transparent rounded-full animate-spin"></div>
             </div>
+            <p className="font-black text-2xl text-slate-800">Processing PDF...</p>
+            <p className="text-slate-500 mt-2">Extracting transactions and applying rules.</p>
           </div>
-        )}
-
-        {/* Main Dashboard - Show if data exists */}
-        {transactions.length > 0 && (
-          <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
-            
-            {/* Sidebar */}
-            <div className="lg:col-span-1">
-              <StatsSidebar stats={stats} />
-            </div>
-
-            {/* Transaction List */}
-            <div className="lg:col-span-3">
-              <div className="flex flex-col sm:flex-row justify-between items-center mb-6 gap-4">
-                 
-                 {/* Search */}
-                 <div className="relative w-full sm:max-w-md">
-                   <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                     <Search className="h-5 w-5 text-slate-400" />
-                   </div>
-                   <input
-                     type="text"
-                     className="block w-full pl-10 pr-3 py-2.5 border border-slate-200 rounded-xl leading-5 bg-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 sm:text-sm shadow-sm"
-                     placeholder="Search transactions..."
-                     value={searchQuery}
-                     onChange={(e) => setSearchQuery(e.target.value)}
-                   />
-                 </div>
-
-                 {/* Top Actions */}
-                 <div className="flex gap-2">
-                    <label className="flex items-center justify-center px-4 py-2 border border-slate-200 rounded-lg text-sm font-medium text-slate-600 bg-white hover:bg-slate-50 cursor-pointer shadow-sm">
-                       <UploadCloud className="w-4 h-4 mr-2" />
-                       Add More
-                       <input type="file" multiple accept=".pdf" onChange={handleFileUpload} className="hidden" />
-                    </label>
-                    <button 
-                      onClick={clearAll}
-                      className="flex items-center justify-center px-4 py-2 border border-red-200 rounded-lg text-sm font-medium text-red-600 bg-red-50 hover:bg-red-100 shadow-sm"
-                    >
-                      <Trash2 className="w-4 h-4 mr-2" />
-                      Clear
-                    </button>
-                 </div>
+        ) : transactions.length === 0 ? (
+          <div className="max-w-xl mx-auto mt-20">
+            <label htmlFor="initial-upload" className="block border-4 border-dashed border-slate-200 rounded-[2.5rem] p-20 hover:border-blue-400 hover:bg-blue-50/50 transition-all cursor-pointer group shadow-sm bg-white text-center">
+              <input id="initial-upload" type="file" multiple accept=".pdf" onChange={handleFileUpload} className="hidden" />
+              <div className="w-24 h-24 bg-blue-100 text-blue-600 rounded-[2rem] flex items-center justify-center mx-auto mb-8 group-hover:scale-110 transition-transform shadow-inner">
+                <UploadCloud size={48} />
               </div>
-
-              {/* List */}
-              <div className="space-y-3">
-                {filteredTransactions.map(transaction => (
-                  <TransactionRow 
-                    key={transaction.id} 
-                    transaction={transaction} 
-                    onUpdate={updateTransaction}
-                    onDelete={deleteTransaction}
-                  />
+              <h2 className="text-3xl font-black text-slate-800 mb-3">Upload Statements</h2>
+              <p className="text-slate-500 mb-8 text-lg font-medium">Drop your PDF bank statements here</p>
+              <div className="inline-block px-10 py-4 bg-blue-600 text-white rounded-2xl font-black shadow-xl hover:shadow-blue-200 transition-all">Browse Files</div>
+            </label>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
+            <div className="lg:col-span-1"><StatsSidebar stats={stats} /></div>
+            <div className="lg:col-span-3 space-y-6">
+              <div className="flex flex-col md:flex-row gap-4 justify-between items-center bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+                <div className="relative w-full max-w-md">
+                  <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" size={20} />
+                  <input type="text" placeholder="Search anything..." className="w-full pl-12 pr-4 py-3 bg-slate-50 border border-slate-100 rounded-xl outline-none focus:ring-4 focus:ring-blue-500/10 focus:bg-white focus:border-blue-500 transition-all" value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
+                </div>
+                <div className="flex gap-3 w-full md:w-auto">
+                   <label htmlFor="add-more-upload" className="flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 cursor-pointer font-black transition-all shadow-lg active:scale-95">
+                      <UploadCloud size={20} /> Add More
+                      <input id="add-more-upload" type="file" multiple accept=".pdf" onChange={handleFileUpload} className="hidden" />
+                   </label>
+                   <button onClick={clearAllData} className="flex-1 md:flex-none flex items-center justify-center gap-2 px-6 py-3 bg-white text-red-500 border border-red-100 rounded-xl hover:bg-red-50 transition-all font-black shadow-sm">
+                     <Trash2 size={20} /> Clear
+                   </button>
+                </div>
+              </div>
+              <div className="space-y-4">
+                {filteredTransactions.map(tx => (
+                  <TransactionRow key={tx.id} transaction={tx} onUpdate={(id, up) => setTransactions(prev => prev.map(t => t.id === id ? {...t, ...up, isEdited: true} : t))} onDelete={id => setTransactions(prev => prev.filter(t => t.id !== id))} />
                 ))}
-                
-                {filteredTransactions.length === 0 && (
-                   <div className="text-center py-20 bg-slate-50 rounded-xl border border-dashed border-slate-300">
-                      <p className="text-slate-500">No transactions match your search.</p>
-                   </div>
-                )}
               </div>
             </div>
           </div>
         )}
       </main>
 
-      {/* Persistent Footer CTA */}
       {transactions.length > 0 && (
-        <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 p-4 shadow-xl z-40">
-          <div className="max-w-7xl mx-auto flex justify-between items-center">
-             <div className="text-sm text-slate-500 hidden sm:block">
-               {stats.editedCount} of {stats.totalTransactions} transactions reviewed
-             </div>
-             <button 
-              onClick={handleExport}
-              className="flex items-center justify-center w-full sm:w-auto px-8 py-3 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl shadow-lg shadow-blue-500/20 transition-all transform active:scale-95"
-            >
-              <Download className="w-5 h-5 mr-2" />
-              Export {stats.totalTransactions} Transactions to CSV
+        <div className="fixed bottom-0 left-0 right-0 bg-white/90 backdrop-blur-xl border-t border-slate-200 p-6 z-40 shadow-[0_-10px_40px_rgba(0,0,0,0.08)]">
+          <div className="max-w-7xl mx-auto flex flex-col sm:flex-row justify-between items-center gap-4">
+            <div className="text-slate-800 font-bold text-lg">
+              <span className="text-blue-600">{transactions.length}</span> transactions identified
+            </div>
+            <button onClick={() => downloadCSV(generateCSV(transactions), `gnucash_export_${new Date().toISOString().slice(0,10)}.csv`)} className="flex items-center gap-2 px-12 py-4 bg-slate-900 text-white font-black rounded-2xl hover:bg-black transition-all shadow-2xl active:scale-95">
+              <Download size={24} /> Export to GnuCash
             </button>
           </div>
         </div>

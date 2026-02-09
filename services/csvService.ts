@@ -4,22 +4,15 @@ export const generateCSV = (transactions: Transaction[]): string => {
   const header = ['Date', 'Description', 'Notes', 'Amount', 'Category', 'Account'];
   
   const rows = transactions.map(t => {
-    // GnuCash typically likes: Date, Description, Deposit, Withdrawal, etc.
-    // Or a simple import format: Date, Description, Amount (neg/pos)
-    
-    // We will use a flexible format:
-    // Date, Description, Notes, Amount (with sign), Category (Target Account)
-    
+    // GnuCash standard CSV import
     const signedAmount = t.type === 'DEBIT' ? -t.amount : t.amount;
     
     return [
       `"${t.date}"`,
       `"${t.description.replace(/"/g, '""')}"`,
-      `"Source: ${t.sourceFile}"`,
+      `"ID: ${t.id} | Source: ${t.sourceFile}"`, // Improved tracking
       `${signedAmount.toFixed(2)}`,
       `"${t.category}"`,
-      // Base account is usually determined during import in GnuCash, 
-      // but we can leave it empty or user maps it.
       "" 
     ].join(',');
   });

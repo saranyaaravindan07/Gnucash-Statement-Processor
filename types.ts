@@ -6,6 +6,7 @@ export interface Transaction {
   amount: number;
   type: 'DEBIT' | 'CREDIT';
   category: string;
+  originalCategory: string;
   sourceFile: string;
   isEdited: boolean;
   isSelected?: boolean;
